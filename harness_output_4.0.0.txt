@@ -1,0 +1,16 @@
+mnemosyne#1163 reproduction harness
+package: mnemosyne-memory ? | mnemosyne 4.0.0 | python 3.14.9
+scratch dir (disposable): /home/chris26/.hermes/cache/scratch/mnem1163-79tbmqiu
+platform: linux | /proc fd counting: True
+
+[0] object model (what provider shutdown expects from core)
+    BeamMemory.close exists            False
+    Mnemosyne.close exists             False
+
+[1] 10 sessions, ONE path, beams dropped                    4   (baseline: TLS reuse, flat)
+[2] 12 sessions, TWO paths, beams kept                     30   (one displaced handle per retained beam)
+[3] drop all refs + gc x2                                  10   (reclaimed 20 of 30; live owners pin the rest)
+[4] close_thread_connection from main thread: returned False (cross-thread: no-op)
+[5] worker thread exits + gc                                0   (full release: the only path that reaches 0 today)
+
+done. scratch dir kept for inspection: /home/chris26/.hermes/cache/scratch/mnem1163-79tbmqiu

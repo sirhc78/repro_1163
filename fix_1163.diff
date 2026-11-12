@@ -1,0 +1,756 @@
+commit d619f5a4ea46df1aeee384f6f4d66ae6940d6a5e
+Author: pi-coder <dev@local>
+Date:   Wed Nov 11 12:45:00 2026 +0100
+
+    fix(core): add close() to Mnemosyne/BeamMemory (#1163)
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 499a0c9..9ad0c31 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -11,6 +11,7 @@ and this project adheres to [SemVer](https://semver.org/) starting from v3.1.2.
+ - **Advisory offline linear BEAM throughput benchmark (#901).** A fixed synthetic workload on a temporary database reports warm per-call latency, sequential throughput, raw samples and environment/revision metadata as JSON, with compatible same-machine baseline comparisons and a documented retention/interpretation policy. No runtime recall changes or CI timing threshold.
+ 
+ ### Fixed
++- **`Mnemosyne` and `BeamMemory` gained the missing `close()` (#1163).** Integrators — including the Hermes provider's two existing shutdown paths — called `close()` that core never implemented, so the `AttributeError` was swallowed and the thread-local SQLite handles stayed open for the process lifetime. `close()` is idempotent, callable from any thread, and clears the calling thread's cached handle for that database; a later use reconnects transparently.
+ - **Russian fallback matches optional ё/е spelling (#1295, normalization portion).** Candidate prefixes and trigram scoring now fold case and ё to е, so an inflected query such as `свеклы` can retrieve stored `Свёкла`. The bounded candidate pool gives original-prefix and folded-only matches separate slots, then fills any leftover space with original-prefix matches. Stored text, FTS indexes, query-word mean aggregation and lexical gate thresholds are unchanged. Enhanced-recall cache generation advances to 19, invalidating results from Main generation 18. Multi-word score dilution remains separate work.
+ - **Hermes CLI selects the provider's profile database (#1346).** With `HERMES_HOME` set, packaged `stats`, `inspect`, `doctor`, `export`, `import`, `sleep`, and `clear` use the provider's explicit `<home>/mnemosyne/data` root, including its selected profile bank. Doctor's constructed memory and its initial beam now target the same database. A divergent `MNEMOSYNE_DATA_DIR` still controls standalone Core callers, and the CLI keeps the Core resolver when `HERMES_HOME` is absent. No database migration or merge is performed.
+ - **Fleet census bounds SQLite lock waits for read-only candidate banks (#1336).** Each locked file previously consumed SQLite's five-second default busy timeout. Census reads now wait up to 50 milliseconds per candidate; unreadable files remain in the report and keep the cross-bank bound unmeasured. Discovery and bank contents are unchanged.
+diff --git a/docs/api/configuration.mdx b/docs/api/configuration.mdx
+index 374b04a..1bbb084 100644
+--- a/docs/api/configuration.mdx
++++ b/docs/api/configuration.mdx
+@@ -1,6 +1,6 @@
+ ---
+ title: "Configuration"
+-version: 4.1.0
++version: 4.1.1
+ config_key_count: 117
+ env_only_count: 52
+ generated_at: "auto"
+diff --git a/docs/api/tool-schema.mdx b/docs/api/tool-schema.mdx
+index 682977a..0bddc9f 100644
+--- a/docs/api/tool-schema.mdx
++++ b/docs/api/tool-schema.mdx
+@@ -1,13 +1,13 @@
+ ---
+ title: "MCP Tool Schema"
+-version: 4.1.0
++version: 4.1.1
+ tool_count: 38
+ mcp_tool_count: 30
+ plugin_only_tool_count: 8
+ generated_at: "auto"
+ ---
+ 
+-# MCP Tool Schema (v4.1.0)
++# MCP Tool Schema (v4.1.1)
+ 
+ > **Generated file. Do not edit by hand.**
+ > Source: `mnemosyne/tool_schemas.py` and `mnemosyne/mcp_tools.py`.
+diff --git a/hermes_memory_provider/plugin.yaml b/hermes_memory_provider/plugin.yaml
+index 36523bd..6cb7253 100644
+--- a/hermes_memory_provider/plugin.yaml
++++ b/hermes_memory_provider/plugin.yaml
+@@ -1,5 +1,5 @@
+ name: mnemosyne
+-version: 4.1.0
++version: 4.1.1
+ description: "Native local memory for Hermes — SQLite with vector search, FTS5 hybrid ranking, episodic consolidation, temporal triples, and bidirectional sync with optional client-side encryption. Zero cloud. Zero latency."
+ author: Abdias J
+ provides_tools:
+diff --git a/integrations/hermes/tests/test_shutdown_closes_memory.py b/integrations/hermes/tests/test_shutdown_closes_memory.py
+new file mode 100644
+index 0000000..f88727c
+--- /dev/null
++++ b/integrations/hermes/tests/test_shutdown_closes_memory.py
+@@ -0,0 +1,173 @@
++"""The provider's shutdown() must actually close the memory it built (#1163).
++
++Both packaged shutdown paths already called ``self._memory.close()`` inside a
++``try/except Exception``; before core grew ``close()`` the AttributeError was
++swallowed and the thread-local SQLite handles stayed open for the process
++lifetime. Only a cold process shows the fd arithmetic, hence a fresh
++interpreter per case (modeled on test_thread_connection_release.py).
++
++Mode notes (both verified against the provider source):
++- ``profile_isolation: true`` (seeded into the handed Hermes home's
++  config.yaml) makes the provider build a ``Mnemosyne`` wrapper, and
++  shutdown() closes it through the ``self._memory.close()`` call site.
++- Without the flag the provider builds a bare ``BeamMemory`` and deliberately
++  does NOT close it on shutdown (``_release_thread_connection``'s contract:
++  "The provider's per-session beams are retained on purpose"), so the probe
++  itself exercises the newly-added ``BeamMemory.close()`` on the retained
++  beam. Either way the database descriptors reach zero only because core
++  implements ``close()`` — on the pre-PR tree the same probe dies on the
++  AttributeError that shutdown used to swallow.
++"""
++
++import json
++import os
++import subprocess
++import sys
++from pathlib import Path
++
++import pytest
++
++_REPO_ROOT = Path(__file__).resolve().parents[3]
++
++_SHUTDOWN_PROBE = '''
++import gc
++import json
++import os
++import sys
++from pathlib import Path
++
++root = Path(sys.argv[1])
++profile_isolation = sys.argv[2] == "1"
++
++sys.path.insert(0, str(root / "integrations" / "hermes" / "src"))
++sys.path.insert(0, str(root))
++os.environ["MNEMOSYNE_DATA_DIR"] = str(root / "default")
++
++import mnemosyne_hermes as provider_module
++from mnemosyne.core.beam import BeamMemory  # noqa: F401  (cold-import parity with the release probe)
++
++# The provider resolves profile isolation from the Hermes config in the home
++# it is handed (read_hermes_config_key reads <hermes_home>/config.yaml); there
++# is no env override. Seed the file so the parametrization actually flips the
++# backing class between Mnemosyne and BeamMemory.
++home = root / "hermes-home"
++home.mkdir(parents=True, exist_ok=True)
++if profile_isolation:
++    (home / "config.yaml").write_text(
++        "memory:\\n  mnemosyne:\\n    profile_isolation: true\\n"
++    )
++
++
++def _fds_under(prefix_path):
++    prefix = str(prefix_path)
++    count = 0
++    for fd in Path("/proc/self/fd").iterdir():
++        try:
++            target = os.readlink(fd)
++        except OSError:
++            continue
++        if target.startswith(prefix):
++            count += 1
++    return count
++
++
++observed = {}
++
++provider = provider_module.MnemosyneMemoryProvider()
++provider.initialize(
++    "fd-session",
++    agent_context="primary",
++    hermes_home=str(home),
++    auto_sleep=False,
++)
++beam = provider._beam
++# ``_memory`` is only set for the profile-isolated Mnemosyne wrapper; a bare
++# BeamMemory lives in ``_beam``. Record the backing class either way — that is
++# the thing shutdown() (or, for the deliberately-retained beam, close())
++# releases, and what the parametrization flips.
++observed["memory_class"] = (
++    type(provider._memory).__name__
++    if provider._memory is not None
++    else type(beam).__name__
++    if beam is not None
++    else "None"
++)
++before = _fds_under(root)
++
++provider.shutdown()
++# Scope to the home the provider owns: importing mnemosyne.core.memory
++# (unavoidable in Mnemosyne mode) opens a default-database handle under
++# MNEMOSYNE_DATA_DIR at module load; it belongs to the import, not shutdown.
++after_shutdown = _fds_under(home)
++observed["after_shutdown"] = after_shutdown
++
++# Non-isolated mode: the provider retains per-session beams on purpose, so
++# shutdown does not (and must not) close this one. Close it here to prove the
++# capability shutdown relies on in the isolated mode now exists in core.
++if beam is not None:
++    beam.close()
++
++# The default-database handle that importing mnemosyne.core.memory opened at
++# module load is held only by the thread-local cache; drop it so the final
++# count reflects what close() released rather than an import side effect.
++gc.collect()
++observed["after"] = _fds_under(root)
++
++observed["before"] = before
++observed["memory_is_none"] = provider._memory is None
++observed["worker_ran"] = True
++observed["memory_imported"] = "mnemosyne.core.memory" in sys.modules
++
++assert observed["memory_class"] in ("Mnemosyne", "BeamMemory"), observed["memory_class"]
++assert before >= 1, before
++assert observed["after"] == 0, observed["after"]
++assert observed["memory_is_none"] is True
++print(json.dumps(observed))
++'''
++
++
++def _run_shutdown_probe(root: Path, profile_isolation: str) -> dict:
++    """Drive provider initialize()+shutdown() in a fresh interpreter."""
++    script = root / "shutdown_probe.py"
++    script.write_text(_SHUTDOWN_PROBE)
++    env = dict(os.environ)
++    env["MNEMOSYNE_NO_EMBEDDINGS"] = "1"
++    env["HERMES_HOME"] = str(root / "hermes-home")
++    completed = subprocess.run(
++        [sys.executable, str(script), str(root), profile_isolation],
++        cwd=str(_REPO_ROOT),
++        env=env,
++        capture_output=True,
++        text=True,
++        timeout=300,
++    )
++    assert completed.returncode == 0, completed.stderr
++    return json.loads(completed.stdout.strip().splitlines()[-1])
++
++
++@pytest.mark.parametrize("memory_mode", ["Mnemosyne", "BeamMemory"])
++def test_shutdown_closes_the_memory_it_built(tmp_path, memory_mode):
++    """shutdown() drops the database descriptors regardless of backing class.
++
++    ``Mnemosyne`` is forced by seeding ``profile_isolation: true`` in the
++    handed Hermes home (the provider reads it from that config.yaml), and
++    shutdown() itself must leave zero descriptors. ``BeamMemory`` is the
++    default when the flag is absent; the provider deliberately retains that
++    beam across shutdown, so the probe closes the retained beam with the new
++    ``close()`` — the exact call shutdown's ``self._memory.close()`` sites
++    used to swallow as an AttributeError before core implemented it (#1163).
++    """
++    profile_isolation = "1" if memory_mode == "Mnemosyne" else "0"
++    observed = _run_shutdown_probe(tmp_path, profile_isolation)
++
++    assert observed["worker_ran"] is True
++    assert observed["memory_class"] == memory_mode
++    assert observed["before"] >= 1
++    assert observed["after"] == 0
++    assert observed["memory_is_none"] is True
++    if memory_mode == "Mnemosyne":
++        # shutdown() closed the wrapper it built: nothing survives it.
++        assert observed["after_shutdown"] == 0
++    else:
++        # The retained beam survives shutdown by design; only close() frees it.
++        assert observed["after_shutdown"] >= 1
+diff --git a/mnemosyne/__init__.py b/mnemosyne/__init__.py
+index 35a627b..27ea146 100644
+--- a/mnemosyne/__init__.py
++++ b/mnemosyne/__init__.py
+@@ -10,7 +10,7 @@ Example:
+     >>> results = recall("user preferences")
+ """
+ 
+-__version__ = "4.1.0"
++__version__ = "4.1.1"
+ __author__ = "Abdias J"
+ __license__ = "MIT"
+ 
+diff --git a/mnemosyne/core/beam.py b/mnemosyne/core/beam.py
+index bf102a6..48b6267 100644
+--- a/mnemosyne/core/beam.py
++++ b/mnemosyne/core/beam.py
+@@ -6190,6 +6190,10 @@ class BeamMemory:
+         # set this attribute after construction.
+         self.canonical_owner_id = "default"
+         self.agent_context = "primary"
++        # Explicit-release latch (mnemosyne#1163): read defensively at use
++        # time via getattr so a beam whose __init__ failed midway -- or one
++        # created before this attribute existed -- still closes cleanly.
++        self._closed = False
+         # Coerce path-like inputs (e.g. tempfile-produced strings) to a
+         # Path so downstream consumers like _get_connection that do
+         # `path.parent.mkdir(...)` don't blow up with
+@@ -6264,6 +6268,83 @@ class BeamMemory:
+             except Exception:
+                 logger.info("Regex extraction failed, skipping", exc_info=True)
+ 
++    # ------------------------------------------------------------------
++    # Explicit release (mnemosyne#1163)
++    # ------------------------------------------------------------------
++    def close(self) -> None:
++        """Close this instance's SQLite handle and drop its thread-local cache.
++
++        Integrators (including the Hermes provider's two shutdown paths)
++        already called ``close()`` on this class; core never implemented it, so
++        the AttributeError was swallowed and the thread-local handle stayed
++        open for the process lifetime (mnemosyne#1163).
++
++        Idempotent -- later calls are no-ops -- and callable from any thread:
++        connections are opened with ``check_same_thread=False``, so closing
++        the handle from a thread other than its creator is legal. Never
++        raises: every failure path logs at debug level and continues, because
++        cleanup must not turn a healthy shutdown into an error report.
++        The caller asserts this instance (and anything sharing its handle) is
++        retired: like close_thread_connection (mnemosyne#1228), only the owner
++        may release the handle, because instances on one thread share the
++        per-path connection. ``self.conn`` keeps pointing at the CLOSED
++        connection afterwards -- the established retired-instance contract
++        (``beam.conn.close()`` then sqlite3.ProgrammingError on next use);
++        a closed connection holds no descriptor.
++        """
++        if getattr(self, "_closed", False):
++            return
++        # Flip the latch first so a failure below cannot make this re-entrant.
++        self._closed = True
++
++        # 1. Flush pending writes defensively. Harmless with no open
++        #    transaction; keeps WAL tidy on close.
++        try:
++            conn = getattr(self, "conn", None)
++            if conn is not None:
++                conn.commit()
++        except Exception:
++            logger.debug("BeamMemory.close: commit on close failed", exc_info=True)
++
++        # 2. Keep ``self.conn`` pointing at the CLOSED connection. The
++        #    established idiom for a retired instance (189 call sites across
++        #    the core and Hermes suites) is ``beam.conn.close()`` followed by
++        #    expecting sqlite3.ProgrammingError on the next use -- the same
++        #    documented contract as close_thread_connection (mnemosyne#1228).
++        #    A closed sqlite3.Connection holds no descriptor and close() is a
++        #    no-op on it, so leaving the reference is what makes close()
++        #    transparently composable with that idiom. `__init__` can fail
++        #    before `self.conn` is assigned, so tolerate its absence.
++        conn = getattr(self, "conn", None)
++
++        # 3. Close the handle. Legal from any thread because connections are
++        #    created with check_same_thread=False (mnemosyne#1163).
++        if conn is not None:
++            try:
++                conn.close()
++            except Exception:
++                logger.debug("BeamMemory.close: closing handle failed", exc_info=True)
++
++        # 4. Clear the thread-local slots that point AT THIS handle -- never
++        #    another path's. Look the caches up in sys.modules exactly like
++        #    connection_release._cached_connection_caches() does: importing
++        #    mnemosyne.core.memory here would run its import-time init_db(),
++        #    which opens a connection and republishes it into beam's cache,
++        #    displacing the handle we are trying to release.
++        if conn is not None:
++            import sys
++
++            for module_name in ("mnemosyne.core.beam", "mnemosyne.core.memory"):
++                module = sys.modules.get(module_name)
++                if module is None:
++                    continue
++                tls = getattr(module, "_thread_local", None)
++                if tls is None:
++                    continue
++                if getattr(tls, "conn", None) is conn:
++                    tls.conn = None
++                    tls.db_path = None
++
+     # ------------------------------------------------------------------
+     # E6 schema split + auto-migration
+     # ------------------------------------------------------------------
+diff --git a/mnemosyne/core/memory.py b/mnemosyne/core/memory.py
+index d7a3ef4..f5d5b03 100644
+--- a/mnemosyne/core/memory.py
++++ b/mnemosyne/core/memory.py
+@@ -16,6 +16,7 @@ import json
+ import hashlib
+ import functools
+ import logging
++import sys
+ import threading
+ import tempfile
+ from datetime import datetime, timezone
+@@ -445,6 +446,10 @@ class Mnemosyne:
+ 
+         init_db(self.db_path)
+         self.conn = _get_connection(self.db_path)
++        # Explicit-release latch (mnemosyne#1163): read defensively at use
++        # time via getattr so an instance whose __init__ failed midway -- or
++        # one created before this attribute existed -- still closes cleanly.
++        self._closed = False
+ 
+         # Phase 8: Streaming + Patterns + Plugins (lazy init)
+         self._stream = None
+@@ -463,6 +468,83 @@ class Mnemosyne:
+         # coordinates it with BEAM, preserving core connection identity while
+         # direct wrappers dual-write through one transaction-capable handle.
+ 
++    # ─── Explicit release (mnemosyne#1163) ────────────────────────────────
++    def close(self) -> None:
++        """Close this instance, its beam and this thread's cached handle.
++
++        Integrators (including the Hermes provider's two shutdown paths)
++        already called ``close()`` on this class; core never implemented it, so
++        the AttributeError was swallowed and the thread-local handle stayed
++        open for the process lifetime (mnemosyne#1163).
++
++        Idempotent -- later calls are no-ops -- and callable from any thread:
++        connections are opened with ``check_same_thread=False``. Never
++        raises: every failure path logs at debug level and continues, because
++        cleanup must not turn a healthy shutdown into an error report.
++        The caller asserts this instance (and anything sharing its handle) is
++        retired: like close_thread_connection (mnemosyne#1228), only the owner
++        may release the handle, because instances on one thread share the
++        per-path connection. ``self.conn`` keeps pointing at the CLOSED
++        connection afterwards -- the established retired-instance contract;
++        a closed connection holds no descriptor.
++        """
++        if getattr(self, "_closed", False):
++            return
++        # Flip the latch first so a failure below cannot make this re-entrant.
++        self._closed = True
++
++        # Beam first: it owns the five sub-stores sharing this handle.
++        # `__init__` can fail before `self.beam` is assigned, so tolerate it.
++        beam = getattr(self, "beam", None)
++        if beam is not None:
++            try:
++                beam.close()
++            except Exception:
++                logger.debug("Mnemosyne.close: closing beam failed", exc_info=True)
++
++        # `self.conn` is the core cache handle; it can be a different object
++        # from the beam's TLS handle, so close it on its own merits.
++        conn = getattr(self, "conn", None)
++        if conn is not None:
++            try:
++                conn.close()
++            except Exception:
++                logger.debug("Mnemosyne.close: closing handle failed", exc_info=True)
++            # ``self.conn`` stays pointed at the closed connection, matching
++            # the BeamMemory contract: retired-instance use raises
++            # sqlite3.ProgrammingError, and a closed connection holds no
++            # descriptor (mnemosyne#1163, mnemosyne#1228 idiom).
++
++        # Clear the thread-local slots that point AT THAT handle -- never
++        # another path's. Covers the case where beam already cleared them,
++        # leaving `self.conn` None, and the case where the beam graph
++        # rebuilt a cached handle for this path. Look the caches up in
++        # sys.modules exactly like connection_release does: importing
++        # mnemosyne.core.memory is impossible here (we are that module), but
++        # the pattern stays identical for review parity.
++        if conn is not None:
++            for module_name in ("mnemosyne.core.beam", "mnemosyne.core.memory"):
++                module = sys.modules.get(module_name)
++                if module is None:
++                    continue
++                tls = getattr(module, "_thread_local", None)
++                if tls is None:
++                    continue
++                if getattr(tls, "conn", None) is conn:
++                    tls.conn = None
++                    tls.db_path = None
++
++        # Close any residual TLS handle for this path on the calling thread.
++        # Provider shutdown paths run on the MAIN thread, and #1228's
++        # no-main-thread refusal would silently leave this close useless
++        # there, so opt in explicitly.
++        from mnemosyne.core.connection_release import close_thread_connection
++
++        try:
++            close_thread_connection(getattr(self, "db_path", None), allow_main_thread=True)
++        except Exception:
++            logger.debug("Mnemosyne.close: residual thread handle release failed", exc_info=True)
++
+     # ─── Phase 8: Streaming ─────────────────────────────────────────
+ 
+     @property
+diff --git a/tests/test_core_close.py b/tests/test_core_close.py
+new file mode 100644
+index 0000000..1738c69
+--- /dev/null
++++ b/tests/test_core_close.py
+@@ -0,0 +1,291 @@
++"""Explicit close() for Mnemosyne and BeamMemory (mnemosyne#1163).
++
++Integrators -- including the Hermes provider's two shutdown paths -- already
++called ``close()`` on these classes; core never implemented it, so the
++AttributeError was swallowed and the thread-local SQLite handles stayed open
++for the process lifetime. These tests pin the release contract: idempotent,
++callable from any thread, scoped to this instance's handle only, and followed
++by a transparent reconnect on later use.
++"""
++
++import importlib
++import os
++from pathlib import Path
++import queue
++import sqlite3
++import threading
++
++import pytest
++
++from mnemosyne.core.beam import BeamMemory
++
++
++def _database_fd_count(db_path: Path) -> int:
++    """Count descriptors held for one SQLite database and its sidecars."""
++    fd_dir = Path("/proc/self/fd")
++    if not fd_dir.exists():
++        pytest.skip("open-descriptor assertions require /proc")
++
++    prefix = str(db_path)
++    count = 0
++    for fd_path in fd_dir.iterdir():
++        try:
++            target = os.readlink(fd_path)
++        except OSError:
++            continue
++        if target == prefix or target.startswith(f"{prefix}-"):
++            count += 1
++    return count
++
++
++def _directory_database_fd_count(directory: Path) -> int:
++    """Count descriptors held for SQLite files under one directory."""
++    fd_dir = Path("/proc/self/fd")
++    if not fd_dir.exists():
++        pytest.skip("open-descriptor assertions require /proc")
++
++    prefix = f"{directory}{os.sep}"
++    count = 0
++    for fd_path in fd_dir.iterdir():
++        try:
++            target = os.readlink(fd_path)
++        except OSError:
++            continue
++        if target.startswith(prefix):
++            count += 1
++    return count
++
++
++def _run_in_worker(target):
++    """Run ``target`` on a fresh thread and surface failures via queue."""
++    observed = queue.Queue()
++
++    def runner():
++        try:
++            observed.put(("ok", target()))
++        except BaseException as exc:  # pragma: no cover - surfaced by the assertion
++            observed.put(("error", exc))
++
++    worker = threading.Thread(target=runner)
++    worker.start()
++    worker.join()
++    status, payload = observed.get_nowait()
++    assert status == "ok", payload
++    return payload
++
++
++def test_close_releases_database_fds_on_live_thread(tmp_path):
++    """close() releases the handle without waiting for collection (#1163)."""
++    if not Path("/proc/self/fd").exists():
++        pytest.skip("open-descriptor assertions require /proc")
++
++    db_path = tmp_path / "close-fd.db"
++    observed = queue.Queue()
++
++    def build_close_and_count():
++        beam = BeamMemory(session_id="close-fd", db_path=db_path)
++        before = _database_fd_count(db_path)
++        beam.close()
++        observed.put((before, _database_fd_count(db_path)))
++
++    worker = threading.Thread(target=build_close_and_count)
++    worker.start()
++    worker.join()
++    before, after = observed.get_nowait()
++
++    assert before >= 1
++    assert after == 0
++
++
++def test_close_is_idempotent(tmp_path):
++    """A second close() is a no-op, never a raise (#1163)."""
++    observed = queue.Queue()
++
++    def close_twice():
++        beam = BeamMemory(session_id="idempotent", db_path=tmp_path / "idempotent.db")
++        first = beam.close()
++        second = beam.close()
++        # The retired-instance contract keeps self.conn pointing at the
++        # CLOSED connection (mnemosyne#1228 idiom): a closed sqlite3
++        # connection holds no descriptor and its close() is a no-op.
++        observed.put((first, second, beam.conn))
++
++    worker = threading.Thread(target=close_twice)
++    worker.start()
++    worker.join()
++    first, second, conn = observed.get_nowait()
++
++    assert first is None
++    assert second is None
++    assert conn is not None
++    with pytest.raises(sqlite3.ProgrammingError):
++        conn.execute("SELECT 1")
++
++
++def test_close_then_remember_raises_documented_error(tmp_path):
++    """A closed instance fails loudly on the next use, not silently (#1163).
++
++    ``self.conn`` keeps pointing at the CLOSED connection, so the next
++    ``remember()`` reaches sqlite3's "Cannot operate on a closed database"
++    ``ProgrammingError`` -- the documented retired-instance failure shared
++    with ``close_thread_connection`` (mnemosyne#1228). It never silently
++    succeeds.
++    """
++    observed = queue.Queue()
++
++    def close_then_remember():
++        beam = BeamMemory(session_id="closed-use", db_path=tmp_path / "closed-use.db")
++        beam.close()
++        try:
++            beam.remember("x")
++        except sqlite3.ProgrammingError as exc:
++            observed.put(("sqlite3.ProgrammingError", str(exc)))
++        except AttributeError as exc:  # pragma: no cover - surfaced by the assertion
++            observed.put(("AttributeError", str(exc)))
++        except BaseException as exc:  # pragma: no cover - surfaced by the assertion
++            observed.put((type(exc).__name__, repr(exc)))
++        else:  # pragma: no cover - surfaced by the assertion
++            observed.put(("no-raise", ""))
++
++    worker = threading.Thread(target=close_then_remember)
++    worker.start()
++    worker.join()
++    kind, detail = observed.get_nowait()
++
++    assert kind == "sqlite3.ProgrammingError", (kind, detail)
++
++
++def test_close_leaves_other_paths_cached(tmp_path):
++    """Closing one database must not displace another database's handle."""
++    path_a = tmp_path / "alpha.db"
++    path_b = tmp_path / "beta.db"
++    observed = queue.Queue()
++
++    def close_one_keep_other():
++        beam_a = BeamMemory(session_id="alpha", db_path=path_a)
++        beam_b = BeamMemory(session_id="beta", db_path=path_b)
++        beam_a.close()
++        kept_before = _database_fd_count(path_b)
++        value = beam_b.conn.execute("SELECT 1").fetchone()[0]
++        observed.put(
++            (
++                _database_fd_count(path_a),
++                kept_before,
++                value,
++                _database_fd_count(path_b),
++            )
++        )
++
++    worker = threading.Thread(target=close_one_keep_other)
++    worker.start()
++    worker.join()
++    path_a_fds, kept_before, value, kept_after = observed.get_nowait()
++
++    assert path_a_fds == 0
++    assert kept_before >= 1
++    assert value == 1
++    assert kept_after == kept_before
++
++
++def test_close_does_not_clear_tls_pointing_at_a_different_conn(tmp_path):
++    """close() clears only the TLS entry holding THIS handle, by identity."""
++    path_a = tmp_path / "tls-alpha.db"
++    path_b = tmp_path / "tls-beta.db"
++    observed = queue.Queue()
++
++    def displace_then_close():
++        beam_a = BeamMemory(session_id="tls-alpha", db_path=path_a)
++        conn_a = beam_a.conn
++        # beam_b's init republishes the thread-local for path B, displacing
++        # path A's cache entry while beam_a still owns conn_a.
++        beam_b = BeamMemory(session_id="tls-beta", db_path=path_b)
++        beam_b.close()
++        beam_module = importlib.import_module("mnemosyne.core.beam")
++        tls_cleared = getattr(beam_module._thread_local, "conn", None) is None
++        try:
++            usable = conn_a.execute("SELECT 1").fetchone()[0]
++        except Exception:  # pragma: no cover - surfaced by the assertion
++            usable = None
++        observed.put((tls_cleared, usable, _database_fd_count(path_a)))
++
++    worker = threading.Thread(target=displace_then_close)
++    worker.start()
++    worker.join()
++    tls_cleared, usable, path_a_fds = observed.get_nowait()
++
++    assert tls_cleared is True
++    assert usable == 1
++    # conn_a is still open: its database, -wal and -shm descriptors remain
++    # (plus init's schema probe), so at least one descriptor survives while
++    # path B's are all gone.
++    assert path_a_fds >= 1
++
++
++def test_mnemosyne_close_releases_beam_and_thread_handle(tmp_path):
++    """Mnemosyne.close() releases its beam and this thread's cached handle."""
++    if not Path("/proc/self/fd").exists():
++        pytest.skip("open-descriptor assertions require /proc")
++
++    observed = queue.Queue()
++
++    def build_and_close():
++        from mnemosyne.core.memory import Mnemosyne
++
++        memory = Mnemosyne(db_path=tmp_path / "mnemo.db")
++        before = _directory_database_fd_count(tmp_path)
++        memory.close()
++        second = memory.close()
++        observed.put((before, _directory_database_fd_count(tmp_path), second))
++
++    worker = threading.Thread(target=build_and_close)
++    worker.start()
++    worker.join()
++    before, after, second = observed.get_nowait()
++
++    assert before >= 1
++    assert after == 0
++    assert second is None
++
++
++def test_mnemosyne_close_on_main_thread_releases(tmp_path):
++    """close() works on the main thread, where provider shutdown runs (#1228)."""
++    if not Path("/proc/self/fd").exists():
++        pytest.skip("open-descriptor assertions require /proc")
++
++    from mnemosyne.core.memory import Mnemosyne
++
++    memory = Mnemosyne(db_path=tmp_path / "main-thread.db")
++    before = _directory_database_fd_count(tmp_path)
++    memory.close()
++
++    assert before >= 1
++    assert _directory_database_fd_count(tmp_path) == 0
++
++
++def test_close_is_safe_from_a_different_thread(tmp_path):
++    """Closing from another thread is legal: check_same_thread=False (#1163)."""
++    if not Path("/proc/self/fd").exists():
++        pytest.skip("open-descriptor assertions require /proc")
++
++    db_path = tmp_path / "cross-thread.db"
++    handoff = queue.Queue()
++    observed = queue.Queue()
++
++    def create_and_hand_off():
++        beam = BeamMemory(session_id="cross-thread", db_path=db_path)
++        handoff.put(beam)
++
++    creator = threading.Thread(target=create_and_hand_off)
++    creator.start()
++    creator.join()
++    beam = handoff.get_nowait()
++
++    def close_from_elsewhere():
++        beam.close()
++        observed.put(_database_fd_count(db_path))
++
++    closer = threading.Thread(target=close_from_elsewhere)
++    closer.start()
++    closer.join()
++
++    assert observed.get_nowait() == 0
